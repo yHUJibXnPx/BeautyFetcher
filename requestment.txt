@@ -1,11 +1,6 @@
+requests
 beautifulsoup4
-ffmpeg-python
-imagehash
-numpy
-opencv-python
 Pillow
 pillow-avif-plugin
 pillow-heif
-requests
-scikit-image
 tqdm

@@ -1,664 +1,411 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Stream-frame pHash video dedupe with SQLite cache.
-Unified image + video deduplication:
-- Parallel image hashing (ThreadPoolExecutor)
-- Correct batch SQLite inserts (no per-row SELECT after executemany)
-- find_candidates rewritten: one GROUP BY query instead of N single queries
-- JPEG temp frames, ffmpeg -an to avoid opus errors
-- dry-run, quarantine, actions.log, bad_videos.log
+dedup_medias.py  (v3) — 只处理“绝对重复”：字节完全相同的文件
 
-Install:
-  python3 -m pip install imagehash pillow opencv-python numpy tqdm scikit-image ffmpeg-python
-  sudo apt install ffmpeg
+这个脚本不做任何“相似”判断：不抽帧、不解码、不算感知哈希。
+一个文件只有在满足下面全部条件时才会被认定为另一个文件的重复：
+  1. 文件大小完全相同
+  2. 头 / 中 / 尾若干段内容的指纹相同（只是为了避免对大量文件做整文件比较的初筛）
+  3. 两个文件从头到尾逐字节比较，完全一致        ← 最终裁决，不依赖任何哈希
+字节完全相同 => 画面、声音、元数据必然完全相同，不存在“看起来像但其实不同”的误判。
 
-Usage:
-  python3 dedup_medias.py "./sex_video"
-  python3 dedup_medias.py "./normal_video" --workers 1 --dry-run
-  python3 dedup_medias.py "美女图集"
-  # 需要精确验证时
-  python3 dedup_medias.py "美女图集" --ssim_threshold 0.85
-  python3 dedup_medias.py "美女图集" --workers 1 --dry-run
+安全设计
+  * 默认只生成报告（duplicates_report.txt），不移动任何文件；加 --apply 才会真正移动
+  * 被判定为重复的文件不会被删除，而是移到隔离区，并写入 actions.jsonl，可用 --undo 还原
+  * 报告里每一组都写明：保留哪一个（KEEP）、移走哪些（MOVE），不会再出现“不知道为什么没了”
+  * 硬链接（同一个文件的多个路径）不算重复，不会处理
+  * 只依赖 Python 标准库（装了 tqdm 会显示进度条）
+
+用法
+  python3 dedup_medias.py normal_video sex_video picture            # 只生成报告，不动任何文件
+  python3 dedup_medias.py normal_video sex_video picture --apply    # 确认报告没问题后，真正移动
+  python3 dedup_medias.py picture --scope dir                       # 只在【同一个目录内】找重复
+  python3 dedup_medias.py --undo --quarantine ./quarantine_duplicates               # 还原全部
+  python3 dedup_medias.py --undo --undo-kind exact --quarantine ./quarantine_duplicates
+  python3 dedup_medias.py --undo --undo-kind near  --quarantine ./quarantine_duplicates   # 还原旧版“近似”移走的文件
+一个例子
+  cd /media/gmktecm6/TOSHIBABLACK2T/mixed
+  # 第一步：只出报告，不动任何文件
+  python3 dedup_medias.py normal_video sex_video picture
+  # 第二步：打开 duplicates_report.txt 看过没问题后，再加 --apply
+  python3 dedup_medias.py normal_video sex_video picture --apply
+
+保留规则（同一组完全相同的文件里留哪一个）
+  1) 命令行里靠前的目录优先；2) 修改时间更早的优先；3) 路径更短的优先；4) 路径字典序。
 """
-import os,io
-import sys
 import argparse
-import sqlite3
-import subprocess
-import time
+import hashlib
+import json
+import os
 import shutil
-from pathlib import Path
-from typing import List, Tuple, Optional, Dict
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
-from PIL import Image
-import imagehash
-import numpy as np
-from tqdm import tqdm
+import sys
+import time
+from collections import defaultdict
+from typing import Dict, List, NamedTuple, Optional
 
 try:
-    from skimage.metrics import structural_similarity as ssim
-except Exception:
-    ssim = None
+    from tqdm import tqdm
+except ImportError:                               # 没装 tqdm 也能跑，只是没有进度条
+    def tqdm(it=None, **kwargs):
+        return it
 
 # --------- Config ----------
-DB_FILE        = "media_frames.db"
-ACTIONS_LOG    = "actions.log"
-QUARANTINE_DIR = "quarantine_duplicates"
-#TMP_FRAME_DIR  = ".dedup_tmp_frames"
-TMP_FRAME_DIR  = "/dev/shm/.dedup_tmp_frames" if os.path.exists("/dev/shm") else "/tmp/.dedup_tmp_frames"
-BAD_LOG        = "bad_medias.log"
-DB_BATCH_SIZE  = 500
+QUARANTINE_NAME = "quarantine_duplicates"
+ACTIONS_NAME    = "actions.jsonl"
+REPORT_NAME     = "duplicates_report.txt"
+EMPTY_LOG       = "empty_files.log"
 
 IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".avif")
 VIDEO_EXTS = (".mp4", ".mkv", ".avi", ".mov", ".flv", ".wmv", ".webm", ".ts", ".m4v")
+SKIP_DIRS  = {"$RECYCLE.BIN", "System Volume Information", "@eaDir", "lost+found", "__MACOSX"}
 
-# --------- Logging ----------
-def log_bad(path: str, reason: str):
-    try:
-        with open(BAD_LOG, "a", encoding="utf-8") as f:
-            f.write(f"{time.time()},{path},{reason}\n")
-    except Exception:
-        pass
+# 旧版本的参数。它们已不存在；遇到时明确报错，避免有人以为它们还在起作用。
+REMOVED_FLAGS = ("--near", "--near-images", "--exact-only", "--delete-bad", "--ssim_threshold",
+                 "--workers", "--video_workers", "--frames", "--hash_alg", "--max_hamming",
+                 "--image_hamming", "--min_match_ratio", "--pos_tol", "--duration_tol", "--db")
 
-def print_bad_summary(delete_bad: bool = False):
-    """
-    Print bad-media summary, write delete_bad.sh, and optionally delete the files.
-    Only files whose reason starts with hash_failed are treated as truly corrupt
-    and included in the delete script / auto-deletion.
-    Other reasons (stat_failed, move_failed) are listed but left alone.
-    """
-    DELETE_SCRIPT = "delete_bad.sh"
 
-    if not os.path.exists(BAD_LOG):
-        print("No bad media logged.")
-        return
+class F(NamedTuple):
+    path: str
+    mtime: int
+    size: int
+    dev: int
+    ino: int
+    ridx: int          # 所属目录在命令行里的序号（越小越优先保留）
 
-    all_bad: dict = {}   # path -> last reason
-    corrupt: list = []   # hash_failed only, in order
 
-    with open(BAD_LOG, "r", encoding="utf-8") as f:
-        for line in f:
-            parts = line.strip().split(",", 2)
-            if len(parts) >= 3:
-                _, fpath, reason = parts[0], parts[1], parts[2]
-            elif len(parts) == 2:
-                fpath, reason = parts[1], ""
-            else:
+# --------- Scanning ----------
+def gather(roots: List[str], qdir: str, exts: tuple):
+    """扫描所有目录；返回 (文件列表, 0 字节文件列表, 被忽略的硬链接数)。"""
+    files: List[F] = []
+    empties: List[str] = []
+    for ridx, root in enumerate(roots):
+        stack = [root]
+        while stack:
+            d = stack.pop()
+            try:
+                it = os.scandir(d)
+            except OSError as e:
+                print(f"  [warn] 无法读取目录 {d}: {e}")
                 continue
-            if fpath not in all_bad:
-                all_bad[fpath] = reason
-                if reason.startswith("hash_failed"):
-                    corrupt.append(fpath)
+            with it:
+                for e in it:
+                    name = e.name
+                    try:
+                        if e.is_dir(follow_symlinks=False):
+                            if name.startswith(".") or name in SKIP_DIRS or e.path == qdir:
+                                continue
+                            stack.append(e.path)
+                        elif e.is_file(follow_symlinks=False):
+                            if name.startswith("._"):                 # macOS AppleDouble 元数据，不是真文件
+                                continue
+                            if os.path.splitext(name)[1].lower() not in exts:
+                                continue
+                            st = e.stat(follow_symlinks=False)
+                            if st.st_size == 0:
+                                empties.append(e.path)
+                                continue
+                            files.append(F(e.path, int(st.st_mtime), st.st_size, st.st_dev, st.st_ino, ridx))
+                    except OSError as ex:
+                        print(f"  [warn] 读取失败 {e.path}: {ex}")
 
-    print(f"\n=== 有问题的媒体文件（共 {len(all_bad)} 个，详见 {BAD_LOG}）===")
-    for fpath, reason in all_bad.items():
-        print(f"  [{reason[:40]}]  {fpath}")
+    files.sort(key=lambda f: (f.ridx, f.path))
+    uniq, seen, hardlinks = [], set(), 0
+    for f in files:                                                   # 同一个 inode 的多个路径 = 同一个文件，不是重复
+        if f.ino:
+            k = (f.dev, f.ino)
+            if k in seen:
+                hardlinks += 1
+                continue
+            seen.add(k)
+        uniq.append(f)
+    return uniq, sorted(empties), hardlinks
 
-    if corrupt:
-        with open(DELETE_SCRIPT, "w", encoding="utf-8") as sh:
-            sh.write("#!/usr/bin/env bash\n")
-            sh.write(f"# 由 dedup_medias.py 自动生成 — 共 {len(corrupt)} 个无法解码的损坏文件\n")
-            sh.write("# 确认无误后执行：bash delete_bad.sh\n\n")
-            for p in corrupt:
-                quoted = "'" + p.replace("'", "'\''") + "'"
-                sh.write(f"rm -fv {quoted}\n")
-        os.chmod(DELETE_SCRIPT, 0o755)
-        print(f"\n已生成删除脚本：{DELETE_SCRIPT}（{len(corrupt)} 个损坏文件）")
-        print(f"  确认后执行：bash {DELETE_SCRIPT}")
 
-        if delete_bad:
-            print(f"\n--delete-bad 已启用，开始删除 {len(corrupt)} 个损坏文件 …")
-            deleted, failed = 0, 0
-            for p in corrupt:
-                try:
-                    os.unlink(p)
-                    deleted += 1
-                except Exception as e:
-                    print(f"  删除失败: {p}  ({e})")
-                    failed += 1
-            print(f"  删除完成：成功 {deleted} 个，失败 {failed} 个")
-    else:
-        print("  无损坏文件（hash_failed），无需生成删除脚本。")
+# --------- Exact comparison ----------
+def quick_fingerprint(path: str, size: int, chunk: int = 1 << 20) -> bytes:
+    """初筛用：大小 + 头/1/3处/2/3处/尾各 1MB。只用来缩小范围，不用来下结论。"""
+    h = hashlib.blake2b(digest_size=16)
+    h.update(str(size).encode())
+    with open(path, "rb") as fh:
+        if size <= 4 * chunk:
+            h.update(fh.read())
+        else:
+            for off in (0, size // 3, 2 * size // 3, size - chunk):
+                fh.seek(off)
+                h.update(fh.read(chunk))
+    return h.digest()
 
-# --------- DB ----------
-def init_db(conn: sqlite3.Connection):
-    cur = conn.cursor()
-    cur.execute("PRAGMA journal_mode=WAL")
-    cur.execute("PRAGMA synchronous=NORMAL")
-    cur.execute("PRAGMA cache_size=-65536")
-    cur.execute("PRAGMA temp_store=MEMORY")
-    cur.execute("""CREATE TABLE IF NOT EXISTS media (
-                    id         INTEGER PRIMARY KEY,
-                    path       TEXT UNIQUE,
-                    mtime      INTEGER,
-                    size       INTEGER,
-                    media_type TEXT
-                   )""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS frames (
-                    id       INTEGER PRIMARY KEY,
-                    media_id INTEGER,
-                    t_sec    REAL,
-                    hash     TEXT,
-                    w        INTEGER,
-                    h        INTEGER,
-                    FOREIGN KEY(media_id) REFERENCES media(id)
-                   )""")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_frames_hash     ON frames(hash)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_frames_media_id ON frames(media_id)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_media_path      ON media(path)")
-    conn.commit()
 
-# --------- Helpers ----------
-def file_meta(path: Path) -> Tuple[int, int]:
-    st = path.stat()
-    return int(st.st_mtime), int(st.st_size)
+def files_identical(a: str, b: str, bufsize: int = 8 << 20) -> bool:
+    """逐字节比较整个文件。任何一个字节不同立即返回 False。"""
+    with open(a, "rb") as fa, open(b, "rb") as fb:
+        while True:
+            x, y = fa.read(bufsize), fb.read(bufsize)
+            if x != y:
+                return False
+            if not x:
+                return True
 
-def is_image(path: Path) -> bool:
-    return path.suffix.lower() in IMAGE_EXTS
 
-def is_video(path: Path) -> bool:
-    return path.suffix.lower() in VIDEO_EXTS
+def keep_key(f: F):
+    return (f.ridx, f.mtime, len(f.path), f.path)
 
-def gather_media(root: Path) -> List[Path]:
-    items = []
-    for p in root.rglob("*"):
-        if p.is_file() and (is_image(p) or is_video(p)):
-            items.append(p)
-    return sorted(items)
 
-def hash_image(path: Path, alg: str, hash_size: int) -> Tuple[Optional[str], Optional[int], Optional[int]]:
-    """Open image once; return (hash_hex, width, height)."""
-    try:
-        with Image.open(path) as im:
-            im = im.convert("RGB")
-            w, h = im.size
-            if alg == "phash":
-                hv = imagehash.phash(im, hash_size=hash_size)
-            elif alg == "dhash":
-                hv = imagehash.dhash(im, hash_size=hash_size)
-            else:
-                hv = imagehash.average_hash(im, hash_size=hash_size)
-            return str(hv), w, h
-    except Exception as e:
-        log_bad(str(path), f"hash_failed:{e}")
-        return None, None, None
+def find_duplicate_groups(files: List[F], scope: str, errors: List[str]) -> List[List[F]]:
+    """返回若干组“逐字节完全相同”的文件，每组至少 2 个，组内已按保留优先级排序（第 0 个保留）。"""
+    buckets: Dict[tuple, List[F]] = defaultdict(list)
+    for f in files:
+        key = (f.size, os.path.dirname(f.path)) if scope == "dir" else (f.size,)
+        buckets[key].append(f)
+    cands = [g for g in buckets.values() if len(g) > 1]
+    print(f"  大小相同的候选组: {len(cands):,}（涉及 {sum(len(g) for g in cands):,} 个文件）")
 
-def cleanup_tmp_frames():
-    d = Path(TMP_FRAME_DIR)
-    if not d.exists():
-        return
-    for f in d.glob("*"):
-        try:
-            f.unlink()
-        except Exception:
-            pass
-
-# --------- ffmpeg ----------
-def extract_frames(video_path: Path, fps: float, width: int) -> List[Path]:
-    out_dir = Path(TMP_FRAME_DIR)
-    out_dir.mkdir(exist_ok=True)
-    stamp   = int(time.time() * 1_000_000)
-    pattern = str(out_dir / f"f{stamp}_%06d.jpg")
-    cmd = [
-        "ffmpeg", "-hide_banner", "-loglevel", "error",
-        "-an", "-i", str(video_path),
-        "-vf", f"fps={fps},scale={width}:-1:flags=lanczos",
-        "-q:v", "5", "-y", pattern,
-    ]
-    try:
-        res = subprocess.run(cmd, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        if res.returncode != 0:
-            err = (res.stderr or b"").decode(errors="ignore").strip()
-            log_bad(str(video_path), f"ffmpeg_failed:{err[:300]}")
-            return []
-    except Exception as e:
-        log_bad(str(video_path), f"ffmpeg_exception:{e}")
-        return []
-    frames = sorted(out_dir.glob(f"f{stamp}_*.jpg"))
-    if not frames:
-        log_bad(str(video_path), "no_frames_extracted")
-    return frames
-
-def extract_frame_hashes_in_memory(video_path: Path, fps: float, width: int, hash_alg: str, hash_size: int) -> List[Tuple[str, int, int]]:
-    """FFmpeg 抽帧全在内存中进行，不写入任何磁盘临时文件"""
-    cmd = [
-        "ffmpeg", "-hide_banner", "-loglevel", "error",
-        "-an", "-i", str(video_path),
-        "-vf", f"fps={fps},scale={width}:-1:flags=lanczos",
-        "-f", "image2pipe", "-vcodec", "mjpeg", "-"  # 输出到 stdout 管道
-    ]
-    try:
-        res = subprocess.run(cmd, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        if res.returncode != 0:
-            err = (res.stderr or b"").decode(errors="ignore").strip()
-            log_bad(str(video_path), f"ffmpeg_failed:{err[:300]}")
-            return []
-    except Exception as e:
-        log_bad(str(video_path), f"ffmpeg_exception:{e}")
-        return []
-
-    # 从内存二进制流中切割 JPEG 图像块并计算哈希
-    data = res.stdout
-    frame_hashes = []
-    start = 0
-    while True:
-        soi = data.find(b'\xff\xd8', start)  # JPEG 文件头
-        if soi == -1: break
-        eoi = data.find(b'\xff\xd9', soi)   # JPEG 文件尾
-        if eoi == -1: break
-        
-        jpg_bytes = data[soi:eoi + 2]
-        start = eoi + 2
-        
-        try:
-            with Image.open(io.BytesIO(jpg_bytes)) as im:
-                im = im.convert("RGB")
-                w, h = im.size
-                if hash_alg == "phash":
-                    hv = imagehash.phash(im, hash_size=hash_size)
-                elif hash_alg == "dhash":
-                    hv = imagehash.dhash(im, hash_size=hash_size)
+    groups: List[List[F]] = []
+    for g in tqdm(cands, desc="Comparing", unit="grp"):
+        by_fp: Dict[bytes, List[F]] = defaultdict(list)
+        for f in g:
+            try:
+                by_fp[quick_fingerprint(f.path, f.size)].append(f)
+            except OSError as e:
+                errors.append(f"读取失败（已跳过）: {f.path}  [{e}]")
+        for same_fp in by_fp.values():
+            if len(same_fp) < 2:
+                continue
+            classes: List[List[F]] = []                               # 把指纹相同的文件按“逐字节相同”分类
+            for f in same_fp:
+                for cls in classes:
+                    try:
+                        same = files_identical(cls[0].path, f.path)
+                    except OSError as e:
+                        errors.append(f"比较失败（已跳过）: {f.path}  [{e}]")
+                        same = False
+                        break
+                    if same:
+                        cls.append(f)
+                        break
                 else:
-                    hv = imagehash.average_hash(im, hash_size=hash_size)
-                frame_hashes.append((str(hv), w, h))
-        except Exception:
-            pass
-            
-    if not frame_hashes:
-        log_bad(str(video_path), "no_frames_extracted")
-    return frame_hashes
-    
-# --------- Worker ----------
-def _hash_worker(args_tuple):
-    p, alg, hash_size = args_tuple
+                    classes.append([f])
+            groups.extend(sorted(c, key=keep_key) for c in classes if len(c) > 1)
+    groups.sort(key=lambda g: g[0].path)
+    return groups
+
+
+# --------- Quarantine ----------
+def unique_dest(dest: str) -> str:
+    if not os.path.lexists(dest):
+        return dest
+    base, ext = os.path.splitext(dest)
+    n = 1
+    while os.path.lexists(f"{base}.dup{n}{ext}"):
+        n += 1
+    return f"{base}.dup{n}{ext}"
+
+
+def move_file(src: str, dest: str) -> str:
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    dest = unique_dest(dest)                                          # 永不覆盖隔离区里已有的文件
     try:
-        mtime, size = file_meta(p)
-    except Exception as e:
-        log_bad(str(p), f"stat_failed:{e}")
-        return None
-    hv, w, h = hash_image(p, alg, hash_size)
-    if hv is None:
-        return None
-    return (str(p), mtime, size, hv, w, h)
-
-# --------- Indexing ----------
-def _parallel_hash(paths: List[Path], alg: str, hash_size: int, workers: int, desc: str) -> List[Tuple]:
-    results = []
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        futs = {ex.submit(_hash_worker, (p, alg, hash_size)): p for p in paths}
-        with tqdm(total=len(paths), desc=desc, unit="file", leave=False) as pb:
-            for fut in as_completed(futs):
-                pb.update(1)
-                try:
-                    r = fut.result()
-                    if r:
-                        results.append(r)
-                except Exception as e:
-                    log_bad(str(futs[fut]), f"worker_exc:{e}")
-    return results
-
-def _batch_insert_images(cur, conn, hashed: List[Tuple], mid_map: Optional[Dict[str,int]] = None):
-    """
-    Insert or update image media rows and their frame hashes in batches.
-    mid_map: if provided, maps path_str -> existing media_id (update mode).
-             if None, new inserts.
-    """
-    for i in range(0, len(hashed), DB_BATCH_SIZE):
-        batch = hashed[i : i + DB_BATCH_SIZE]
-
-        if mid_map is None:
-            # New rows: INSERT then batch SELECT to get assigned ids
-            cur.executemany(
-                "INSERT OR IGNORE INTO media (path, mtime, size, media_type) VALUES (?,?,?,'image')",
-                [(r[0], r[1], r[2]) for r in batch],
-            )
-            conn.commit()
-            placeholders = ",".join("?" * len(batch))
-            cur.execute(
-                f"SELECT path, id FROM media WHERE path IN ({placeholders})",
-                [r[0] for r in batch],
-            )
-            path_to_id = dict(cur.fetchall())
-            frame_rows = [
-                (path_to_id[r[0]], None, r[3], r[4], r[5])
-                for r in batch if r[0] in path_to_id
-            ]
-        else:
-            # Changed rows: delete old frames, update mtime/size, re-insert frames
-            mids = [(mid_map[r[0]],) for r in batch if r[0] in mid_map]
-            if mids:
-                cur.executemany("DELETE FROM frames WHERE media_id=?", mids)
-            cur.executemany(
-                "UPDATE media SET mtime=?, size=? WHERE id=?",
-                [(r[1], r[2], mid_map[r[0]]) for r in batch if r[0] in mid_map],
-            )
-            frame_rows = [
-                (mid_map[r[0]], None, r[3], r[4], r[5])
-                for r in batch if r[0] in mid_map
-            ]
-
-        if frame_rows:
-            cur.executemany(
-                "INSERT INTO frames (media_id, t_sec, hash, w, h) VALUES (?,?,?,?,?)",
-                frame_rows,
-            )
-        conn.commit()
+        os.rename(src, dest)
+    except OSError:                                                   # 跨文件系统：复制后再删除
+        shutil.move(src, dest)
+    return dest
 
 
-# --------- Stale DB cleanup ----------
-def cleanup_stale_db(conn: sqlite3.Connection, current_paths: List[Path]):
-    """
-    Remove DB entries for files that no longer exist on disk.
-    Called once per run with the result of gather_media(), so no extra stat() calls needed.
-    Uses the same temp-table trick to avoid SQLite 999-variable limit.
-    """
-    cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) FROM media")
-    total_before = cur.fetchone()[0]
-    if total_before == 0:
+def root_labels(roots: List[str]) -> List[str]:
+    used, labels = set(), []
+    for r in roots:
+        base = os.path.basename(r.rstrip(os.sep)) or "root"
+        label, n = base, 1
+        while label in used:
+            n += 1
+            label = f"{base}_{n}"
+        used.add(label)
+        labels.append(label)
+    return labels
+
+
+def write_action(qdir: str, rec: dict):
+    line = json.dumps(rec, ensure_ascii=False)
+    try:
+        line.encode("utf-8")
+    except UnicodeEncodeError:                                        # 文件名含无法用 UTF-8 表示的字节
+        line = json.dumps(rec, ensure_ascii=True)
+    with open(os.path.join(qdir, ACTIONS_NAME), "a", encoding="utf-8") as fh:
+        fh.write(line + "\n")
+
+
+def apply_groups(groups: List[List[F]], roots: List[str], qdir: str, errors: List[str]):
+    labels = root_labels(roots)
+    moved = reclaimed = 0
+    todo = sum(len(g) - 1 for g in groups)
+    bar = tqdm(total=todo, desc="Moving", unit="file")
+    for g in groups:
+        keep = g[0]
+        for f in g[1:]:
+            rel = f.path[len(roots[f.ridx]) + 1:]
+            dest = os.path.join(qdir, labels[f.ridx], rel)
+            try:
+                dest = move_file(f.path, dest)
+            except OSError as e:
+                errors.append(f"移动失败: {f.path}  [{e}]")
+                continue
+            write_action(qdir, {"t": time.time(), "kind": "exact", "keep": keep.path, "remove": f.path,
+                                "dest": dest, "size": f.size})
+            moved += 1
+            reclaimed += f.size
+            if bar is not None and hasattr(bar, "update"):
+                bar.update(1)
+    if bar is not None and hasattr(bar, "close"):
+        bar.close()
+    return moved, reclaimed
+
+
+# --------- Report ----------
+def human(n: float) -> str:
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return f"{n:.1f} {unit}" if unit != "B" else f"{int(n)} B"
+        n /= 1024
+    return f"{n:.1f} TB"
+
+
+def write_report(groups: List[List[F]], path: str):
+    with open(path, "w", encoding="utf-8", errors="replace") as fh:
+        fh.write(f"# 字节完全相同的文件组，共 {len(groups)} 组（KEEP = 保留，MOVE = 将被移到隔离区）\n\n")
+        for i, g in enumerate(groups, 1):
+            fh.write(f"[{i}] size={g[0].size} ({human(g[0].size)})  copies={len(g)}\n")
+            fh.write(f"  KEEP  {g[0].path}\n")
+            for f in g[1:]:
+                fh.write(f"  MOVE  {f.path}\n")
+            fh.write("\n")
+
+
+# --------- Undo ----------
+def undo(qdir: str, kind: Optional[str] = None):
+    fp = os.path.join(qdir, ACTIONS_NAME)
+    if not os.path.exists(fp):
+        print(f"找不到 {fp}")
         return
-
-    # Build set of current paths (already stat'd by gather_media)
-    current_set = {str(p) for p in current_paths}
-
-    # Load all DB paths, find which are missing
-    cur.execute("SELECT id, path FROM media")
-    stale = [(row[0],) for row in cur.fetchall() if row[1] not in current_set]
-
-    if not stale:
-        print(f"  DB stale check: all {total_before:,} entries still on disk, nothing to clean.")
-        return
-
-    print(f"  DB stale cleanup: removing {len(stale):,} entries no longer on disk …")
-    # Batch delete frames then media
-    for i in range(0, len(stale), DB_BATCH_SIZE):
-        batch = stale[i : i + DB_BATCH_SIZE]
-        cur.executemany("DELETE FROM frames WHERE media_id=?", batch)
-        cur.executemany("DELETE FROM media  WHERE id=?",       batch)
-    conn.commit()
-    print(f"  DB stale cleanup done. Entries before: {total_before:,}  removed: {len(stale):,}")
-
-def index_media(conn: sqlite3.Connection, media_paths: List[Path],
-                fps: float, hash_alg: str, hash_size: int,
-                frame_width: int, workers: int):
-    cur = conn.cursor()
-
-    cur.execute("SELECT id, path, mtime, size FROM media")
-    existing: Dict[str, Tuple[int,int,int]] = {
-        row[1]: (row[0], row[2], row[3]) for row in cur.fetchall()
-    }
-
-    images = [p for p in media_paths if is_image(p)]
-    videos = [p for p in media_paths if is_video(p)]
-    print(f"  Images: {len(images):,}   Videos: {len(videos):,}")
-
-    # Partition images
-    new_images:     List[Path]             = []
-    changed_images: List[Tuple[Path, int]] = []
-    for p in images:
-        ps = str(p)
-        if ps in existing:
-            mid, ex_mt, ex_sz = existing[ps]
-            try:
-                mt, sz = file_meta(p)
-            except Exception:
-                continue
-            if ex_mt != mt or ex_sz != sz:
-                changed_images.append((p, mid))
+    with open(fp, "r", encoding="utf-8") as fh:
+        recs = [json.loads(line) for line in fh if line.strip()]
+    if kind:
+        recs = [r for r in recs if r.get("kind") == kind]
+    restored = conflict = missing = 0
+    for r in tqdm(list(reversed(recs)), desc="Restoring", unit="file"):
+        src, dst = r["dest"], r["remove"]
+        if not os.path.exists(src):
+            missing += 1                       # 隔离区里已经没有这个文件（可能之前已还原或被手动处理）
+        elif os.path.exists(dst):
+            conflict += 1                      # 原位置已有同名文件，不覆盖
         else:
-            new_images.append(p)
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.move(src, dst)
+            restored += 1
+    print(f"已还原 {restored} 个（范围：{kind or '全部'}，共 {len(recs)} 条记录；"
+          f"隔离区里已不存在 {missing}，原位置已有同名文件 {conflict}）")
 
-    if new_images:
-        print(f"  New images: {len(new_images):,}")
-        hashed = _parallel_hash(new_images, hash_alg, hash_size, workers, "  Hashing new images")
-        _batch_insert_images(cur, conn, hashed, mid_map=None)
-
-    if changed_images:
-        print(f"  Changed images: {len(changed_images):,}")
-        paths_only = [p for p, _ in changed_images]
-        mid_map    = {str(p): mid for p, mid in changed_images}
-        hashed     = _parallel_hash(paths_only, hash_alg, hash_size, workers, "  Re-hashing changed images")
-        _batch_insert_images(cur, conn, hashed, mid_map=mid_map)
-
-    # Videos
-    for p in tqdm(videos, desc="Videos", unit="vid"):
-        ps = str(p)
-        try:
-            mtime, size = file_meta(p)
-        except Exception as e:
-            log_bad(ps, f"stat_failed:{e}")
-            continue
-
-        if ps in existing:
-            mid, ex_mt, ex_sz = existing[ps]
-            if ex_mt == mtime and ex_sz == size:
-                continue
-            cur.execute("DELETE FROM frames WHERE media_id=?", (mid,))
-            cur.execute("UPDATE media SET mtime=?, size=? WHERE id=?", (mtime, size, mid))
-            conn.commit()
-            media_id = mid
-        else:
-            cur.execute(
-                "INSERT OR IGNORE INTO media (path, mtime, size, media_type) VALUES (?,?,?,'video')",
-                (ps, mtime, size),
-            )
-            conn.commit()
-            media_id = cur.lastrowid
-
-        #frame_paths = extract_frames(p, fps, frame_width)
-        #if not frame_paths:
-        #    continue
-
-        #idx_map   = {str(fp): idx for idx, fp in enumerate(frame_paths)}
-        #hashed    = _parallel_hash(frame_paths, hash_alg, hash_size,
-        #                           min(workers, len(frame_paths)), "  Frames")
-        #frame_rows = [
-        #    (media_id, idx_map.get(r[0], 0) / max(fps, 1e-6), r[3], r[4], r[5])
-        #    for r in hashed
-        #]
-        ## Clean up temp frame files
-        #for fp in frame_paths:
-        #    try: fp.unlink()
-        #    except Exception: pass
-
-        #if frame_rows:
-        #    cur.executemany(
-        #        "INSERT INTO frames (media_id, t_sec, hash, w, h) VALUES (?,?,?,?,?)",
-        #        frame_rows,
-        #    )
-        #    conn.commit()
-        hashed = extract_frame_hashes_in_memory(p, fps, frame_width, hash_alg, hash_size)
-        if not hashed:
-            continue
-
-        frame_rows = [
-            (media_id, idx / max(fps, 1e-6), r[0], r[1], r[2])
-            for idx, r in enumerate(hashed)
-        ]
-
-        if frame_rows:
-            cur.executemany(
-                "INSERT INTO frames (media_id, t_sec, hash, w, h) VALUES (?,?,?,?,?)",
-                frame_rows,
-            )
-            conn.commit()
-    conn.commit()
-
-# --------- Candidate search — GROUP BY, no N×single queries ----------
-def find_candidates(conn: sqlite3.Connection, min_match_ratio: float):
-    cur = conn.cursor()
-
-    # One query: all hashes shared by >1 distinct media_id
-    print("  Querying shared hashes …")
-    cur.execute("""
-        SELECT hash, GROUP_CONCAT(DISTINCT media_id), COUNT(DISTINCT media_id)
-        FROM frames
-        WHERE hash IS NOT NULL
-        GROUP BY hash
-        HAVING COUNT(DISTINCT media_id) > 1
-    """)
-    rows = cur.fetchall()
-    print(f"  Shared-hash groups: {len(rows):,}")
-
-    pair_counts: Dict[Tuple[int,int], int] = {}
-    print(f"  Building pairs from {len(rows):,} hash groups (may take a while) ...")
-    skipped_large = 0
-    for _, mids_str, cnt in tqdm(rows, desc="  Pairing", unit="group"):
-        if cnt > 500:  # skip runaway groups (common background hash shared by thousands)
-            skipped_large += 1
-            continue
-        mids = list(map(int, mids_str.split(",")))
-        for i, a in enumerate(mids):
-            for b in mids[i+1:]:
-                key = (a, b) if a < b else (b, a)
-                pair_counts[key] = pair_counts.get(key, 0) + 1
-
-    print(f"  Raw pairs: {len(pair_counts):,}  (skipped {skipped_large} oversized groups)")
-    if not pair_counts:
-        return [], {}
-
-    # Collect all relevant media ids
-    all_mids = set()
-    for a, b in pair_counts:
-        all_mids.add(a); all_mids.add(b)
-
-    # Use a temp table to avoid SQLite's 999-variable IN() limit
-    cur.execute("CREATE TEMP TABLE IF NOT EXISTS _mids (id INTEGER PRIMARY KEY)")
-    cur.execute("DELETE FROM _mids")
-    cur.executemany("INSERT OR IGNORE INTO _mids VALUES (?)", [(m,) for m in all_mids])
-    conn.commit()
-
-    cur.execute("""
-        SELECT f.media_id, COUNT(*)
-        FROM frames f
-        JOIN _mids m ON f.media_id = m.id
-        GROUP BY f.media_id
-    """)
-    frame_counts: Dict[int, int] = dict(cur.fetchall())
-
-    candidates = []
-    for (a, b), match_count in pair_counts.items():
-        ratio = match_count / max(frame_counts.get(a, 1), frame_counts.get(b, 1))
-        if ratio >= min_match_ratio:
-            candidates.append((a, b, match_count, ratio))
-
-    cur.execute("SELECT media.id, media.path FROM media JOIN _mids m ON media.id = m.id")
-    media_map = dict(cur.fetchall())
-
-    return candidates, media_map
-
-# --------- Act ----------
-def decide_and_act(conn, candidates, media_map, args):
-    actions = []
-    os.makedirs(args.quarantine, exist_ok=True)
-    for a, b, match_count, ratio in tqdm(candidates, desc="Verifying & acting"):
-        try:
-            path_a = Path(media_map[a])
-            path_b = Path(media_map[b])
-        except Exception:
-            continue
-        try:
-            meta_a = (path_a.stat().st_size, path_a.stat().st_mtime)
-            meta_b = (path_b.stat().st_size, path_b.stat().st_mtime)
-        except Exception as e:
-            log_bad(str(path_a), f"stat_failed:{e}")
-            continue
-
-        keep, remove = (path_a, path_b) if meta_a >= meta_b else (path_b, path_a)
-
-        ssim_score = None
-        if args.ssim_threshold and ssim is not None:
-            tmp_dir = Path(TMP_FRAME_DIR)
-            tmp_dir.mkdir(exist_ok=True)
-            tmp_a, tmp_b = tmp_dir / f"s_a_{a}.jpg", tmp_dir / f"s_b_{b}.jpg"
-            try:
-                for src, dst in [(path_a, tmp_a), (path_b, tmp_b)]:
-                    if is_image(src):
-                        shutil.copy2(src, dst)
-                    else:
-                        subprocess.run(
-                            ["ffmpeg", "-hide_banner", "-loglevel", "error",
-                             "-an", "-i", str(src), "-vf", "fps=1,scale=256:-1",
-                             "-vframes", "1", "-y", str(dst)], check=False)
-                if tmp_a.exists() and tmp_b.exists():
-                    ia = np.array(Image.open(tmp_a).convert("L"), dtype=np.float32)
-                    ib = np.array(Image.open(tmp_b).convert("L"), dtype=np.float32)
-                    if ia.shape != ib.shape:
-                        import cv2
-                        ib = cv2.resize(ib, (ia.shape[1], ia.shape[0]))
-                    ssim_score = float(ssim(ia, ib))
-            except Exception:
-                ssim_score = None
-            finally:
-                for t in (tmp_a, tmp_b):
-                    try: t.unlink()
-                    except Exception: pass
-            if ssim_score is not None and ssim_score < args.ssim_threshold:
-                continue
-
-        rel  = os.path.relpath(str(remove), start=args.root)
-        dest = os.path.join(args.quarantine, rel)
-        os.makedirs(os.path.dirname(dest), exist_ok=True)
-        actions.append({"keep": str(keep), "remove": str(remove),
-                         "ratio": ratio, "ssim": ssim_score, "dest": dest})
-        if args.dry_run:
-            print(f"[DRY-RUN] {remove} -> {dest}")
-        else:
-            try:
-                try:    os.replace(remove, dest)
-                except: shutil.move(remove, dest)
-                with open(ACTIONS_LOG, "a", encoding="utf-8") as f:
-                    f.write(f"{time.time()},{keep},{remove},{dest},{ratio},{ssim_score}\n")
-            except Exception as e:
-                log_bad(str(remove), f"move_failed:{e}")
-    return actions
 
 # --------- CLI ----------
 def parse_args():
-    p = argparse.ArgumentParser(description="Image+video dedupe — parallel & batched")
-    p.add_argument("root")
-    p.add_argument("--fps",             type=float, default=0.5)
-    p.add_argument("--frame-width",     type=int,   default=128)
-    p.add_argument("--hash_alg",        choices=("phash","dhash","ahash"), default="phash")
-    p.add_argument("--hash_size",       type=int,   default=16)
-    p.add_argument("--min_match_ratio", type=float, default=0.25)
-    p.add_argument("--ssim_threshold",  type=float, default=0.0,
-                   help="SSIM threshold, 0=disabled (default). Use 0.85 only on small sets")
-    p.add_argument("--workers",         type=int,   default=os.cpu_count() or 4)
-    p.add_argument("--dry-run",         action="store_true")
-    p.add_argument("--quarantine",      default=QUARANTINE_DIR)
-    p.add_argument("--delete-bad",     action="store_true",
-                   help="自动删除 hash_failed 的损坏文件（同时生成 delete_bad.sh）")
-    return p.parse_args()
+    p = argparse.ArgumentParser(description="只处理字节完全相同的重复文件（默认只出报告，--apply 才移动）")
+    p.add_argument("roots", nargs="*", help="要扫描的目录（可多个；靠前的目录里的文件优先保留）")
+    p.add_argument("--apply", action="store_true", help="真正把重复文件移到隔离区（不加则只生成报告）")
+    p.add_argument("--scope", choices=("all", "dir"), default="all",
+                   help="all=所有目录之间互相比较（默认）；dir=只在同一个目录内找重复")
+    p.add_argument("--ext", default=None, help="要处理的扩展名，逗号分隔，如 .mkv,.mp4（默认：常见图片+视频）")
+    p.add_argument("--quarantine", default=None,
+                   help=f"隔离区目录（默认：第一个目录的上一级/{QUARANTINE_NAME}，与源文件同盘以便直接 rename）")
+    p.add_argument("--report", default=REPORT_NAME, help=f"报告文件路径（默认 ./{REPORT_NAME}）")
+    p.add_argument("--dry-run", action="store_true", help=argparse.SUPPRESS)     # 兼容旧习惯：现在默认就是只出报告
+    p.add_argument("--undo", action="store_true", help="按隔离区的 actions.jsonl 把文件还原回原位置")
+    p.add_argument("--undo-kind", choices=("exact", "near", "corrupt"), default=None,
+                   help="配合 --undo：只还原某一类（exact=字节相同；near/corrupt 是旧版本留下的记录）")
+    args = p.parse_args()
+    if not args.undo and not args.roots:
+        p.error("需要至少一个目录")
+    return args
+
+
+def reject_removed_flags(argv: List[str]):
+    hit = sorted({a.split("=")[0] for a in argv if a.split("=")[0] in REMOVED_FLAGS})
+    if hit:
+        print("这些参数在 v3 里已经不存在：", " ".join(hit))
+        print("v3 只处理“字节完全相同”的文件，不再有近似判断、抽帧、SSIM、损坏检测，也不再自动删除任何文件。")
+        print("请去掉它们后重新运行（默认只出报告，加 --apply 才会移动到隔离区）。")
+        sys.exit(2)
+
 
 def main():
+    reject_removed_flags(sys.argv[1:])
     args = parse_args()
-    root = Path(args.root)
-    if not root.exists() or not root.is_dir():
-        print("Invalid root:", args.root); sys.exit(1)
 
-    cleanup_tmp_frames()
-    conn = sqlite3.connect(DB_FILE)
-    init_db(conn)
+    if args.undo:
+        undo(os.path.abspath(args.quarantine or QUARANTINE_NAME), args.undo_kind)
+        return
 
-    media = gather_media(root)
-    print(f"Found {len(media):,} media files")
+    roots: List[str] = []
+    for r in args.roots:
+        rp = os.path.realpath(r)
+        if not os.path.isdir(rp):
+            print("Invalid root:", r)
+            sys.exit(1)
+        if rp not in roots:
+            roots.append(rp)                                          # 保持命令行顺序（决定保留优先级）
+    roots = [r for i, r in enumerate(roots)
+             if not any(r.startswith(o + os.sep) for o in roots if o != r)]   # 去掉被其它目录包含的子目录
+    qdir = os.path.abspath(args.quarantine) if args.quarantine \
+        else os.path.join(os.path.dirname(roots[0]), QUARANTINE_NAME)
 
-    cleanup_stale_db(conn, media)
-    index_media(conn, media, args.fps, args.hash_alg, args.hash_size, args.frame_width, args.workers)
+    exts = tuple(e.strip().lower() if e.strip().startswith(".") else "." + e.strip().lower()
+                 for e in args.ext.split(",") if e.strip()) if args.ext else IMAGE_EXTS + VIDEO_EXTS
 
-    print("Searching candidates …")
-    candidates, media_map = find_candidates(conn, args.min_match_ratio)
-    print(f"Candidate pairs: {len(candidates):,}")
+    print("扫描目录 …")
+    files, empties, hardlinks = gather(roots, qdir, exts)
+    print(f"Found {len(files):,} files  (roots: {', '.join(roots)})")
+    if hardlinks:
+        print(f"  已忽略 {hardlinks:,} 个硬链接路径（与另一个路径是同一个文件，不算重复）")
+    if empties:
+        with open(EMPTY_LOG, "w", encoding="utf-8", errors="replace") as fh:
+            fh.write("\n".join(empties) + "\n")
+        print(f"  发现 {len(empties):,} 个 0 字节文件（脚本不会处理它们，列表见 {EMPTY_LOG}）")
 
-    args.root = str(root)
-    actions = decide_and_act(conn, candidates, media_map, args)
-    print(f"Done. Actions: {len(actions)}")
+    errors: List[str] = []
+    groups = find_duplicate_groups(files, args.scope, errors)
+    n_move = sum(len(g) - 1 for g in groups)
+    reclaim = sum(f.size for g in groups for f in g[1:])
+    write_report(groups, args.report)
 
-    cleanup_tmp_frames()
-    print_bad_summary(delete_bad=args.delete_bad)
+    print(f"\n字节完全相同的重复组: {len(groups):,}；其中可移走 {n_move:,} 个文件，共 {human(reclaim)}")
+    print(f"完整报告（每组写明保留哪个、移走哪些）: {os.path.abspath(args.report)}")
+    for g in groups[:5]:
+        print(f"  例: KEEP {g[0].path}")
+        for f in g[1:]:
+            print(f"      MOVE {f.path}")
+
+    if not groups:
+        pass
+    elif not args.apply:
+        print("\n[未移动任何文件] 请先查看报告；确认无误后加 --apply 再运行一次。")
+    else:
+        os.makedirs(qdir, exist_ok=True)
+        moved, reclaimed = apply_groups(groups, roots, qdir, errors)
+        print(f"\n已移动 {moved:,} 个文件到隔离区（{human(reclaimed)}）: {qdir}")
+        print(f"还原: python3 {os.path.basename(sys.argv[0])} --undo --quarantine {qdir}")
+        print("隔离区的文件不会被自动删除；确认无误后，你可以自己删除隔离区释放空间。")
+
+    if errors:
+        print(f"\n有 {len(errors)} 个文件读取/比较/移动失败（未做任何处理）：")
+        for e in errors[:50]:
+            print("  ", e)
+        if len(errors) > 50:
+            print(f"  … 其余 {len(errors) - 50} 条省略")
+
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n已中断。已经移动的文件都记录在隔离区的 actions.jsonl 里，可用 --undo 还原。")
+        sys.exit(130)
